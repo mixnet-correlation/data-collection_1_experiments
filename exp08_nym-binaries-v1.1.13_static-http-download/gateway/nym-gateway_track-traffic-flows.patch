@@ -1,0 +1,396 @@
+diff --git a/gateway/src/node/client_handling/websocket/connection_handler/authenticated.rs b/gateway/src/node/client_handling/websocket/connection_handler/authenticated.rs
+index 7ff47a9f1..1e0955b94 100644
+--- a/gateway/src/node/client_handling/websocket/connection_handler/authenticated.rs
++++ b/gateway/src/node/client_handling/websocket/connection_handler/authenticated.rs
+@@ -23,6 +23,12 @@ use crate::node::client_handling::FREE_TESTNET_BANDWIDTH_VALUE;
+ use gateway_requests::iv::IV;
+ use nym_task::TaskClient;
+
++// [MIXCORR] Required imports for our patches.
++use std::env;
++use std::io::prelude::*;
++use std::time::SystemTime;
++use std::fs::{File, OpenOptions};
++
+ #[derive(Debug, Error)]
+ pub(crate) enum RequestHandlingError {
+     #[error("Internal gateway storage error")]
+@@ -185,6 +191,8 @@ where
+             error!("We failed to forward requested mix packet - {err}. Presumably our mix forwarder has crashed. We cannot continue.");
+             process::exit(1);
+         }
++
++        trace!("[MIXCORR] [forward_packet] Sent Sphinx packet from endpoint into mix forwarder (gateway) to be sent to first mixnode");
+     }
+
+     /// Tries to handle the received bandwidth request by checking correctness of the received data
+@@ -282,11 +290,15 @@ where
+     async fn handle_forward_sphinx(
+         &self,
+         mix_packet: MixPacket,
++        to_gateway_file: Option<&mut File>,
++        msg_ts: u128,
+     ) -> Result<ServerResponse, RequestHandlingError> {
+-        let consumed_bandwidth = mix_packet.sphinx_packet().len() as i64;
+
++        let consumed_bandwidth = mix_packet.sphinx_packet().len() as i64;
+         let available_bandwidth = self.get_available_bandwidth().await?;
+
++        trace!("[MIXCORR] [handle_forward_sphinx] Forwarding Sphinx packet of size {} from endpoint to gateway, available bandwidth: {}", consumed_bandwidth, available_bandwidth);
++
+         if available_bandwidth < consumed_bandwidth {
+             return Ok(ServerResponse::new_error(
+                 "Insufficient bandwidth available",
+@@ -296,6 +308,15 @@ where
+         self.consume_bandwidth(consumed_bandwidth).await?;
+         self.forward_packet(mix_packet);
+
++        // [MIXCORR] Write <msg_ts,msg_size> tuple to file for direction towards gateway.
++        if let Some(to_gateway_file) = to_gateway_file {
++            let log_line = format!("{},{}\n", msg_ts, consumed_bandwidth);
++            to_gateway_file.write_all(log_line.as_bytes()).unwrap();
++            to_gateway_file.flush().unwrap();
++        } else {
++            trace!("[MIXCORR] [handle_forward_sphinx] SphinxFlow file handler towards gateway was empty!");
++        }
++
+         Ok(ServerResponse::Send {
+             remaining_bandwidth: available_bandwidth - consumed_bandwidth,
+         })
+@@ -306,16 +327,21 @@ where
+     /// # Arguments
+     ///
+     /// * `bin_msg`: raw message to handle.
+-    async fn handle_binary(&self, bin_msg: Vec<u8>) -> Message {
++    async fn handle_binary(&self, bin_msg: Vec<u8>, to_gateway_file: Option<&mut File>, msg_ts: u128) -> Message {
+         // this function decrypts the request and checks the MAC
+         match BinaryRequest::try_from_encrypted_tagged_bytes(bin_msg, &self.client.shared_keys) {
+-            Err(e) => RequestHandlingError::InvalidBinaryRequest(e).into_error_message(),
++            Err(e) => {
++                trace!("[MIXCORR] [handle_binary] Failed to decrypt a BinaryRequest into a ForwardSphinx packet");
++                RequestHandlingError::InvalidBinaryRequest(e).into_error_message()
++            },
+             Ok(request) => match request {
+                 // currently only a single type exists
+-                BinaryRequest::ForwardSphinx(mix_packet) => self
+-                    .handle_forward_sphinx(mix_packet)
+-                    .await
+-                    .into_ws_message(),
++                BinaryRequest::ForwardSphinx(mix_packet) => {
++                    trace!("[MIXCORR] [handle_binary] Successfully decrypted a BinaryRequest into a ForwardSphinx packet");
++                    self.handle_forward_sphinx(mix_packet, to_gateway_file, msg_ts)
++                        .await
++                        .into_ws_message()
++                },
+             },
+         }
+     }
+@@ -328,6 +354,7 @@ where
+     ///
+     /// * `raw_request`: raw message to handle.
+     async fn handle_text(&mut self, raw_request: String) -> Message {
++        trace!("[MIXCORR] [handle_text] Received a Text message, but we only care about Binary");
+         match ClientControlRequest::try_from(raw_request) {
+             Err(e) => RequestHandlingError::InvalidTextRequest(e).into_error_message(),
+             Ok(request) => match request {
+@@ -349,12 +376,12 @@ where
+     /// # Arguments
+     ///
+     /// * `raw_request`: raw received websocket message.
+-    async fn handle_request(&mut self, raw_request: Message) -> Option<Message> {
++    async fn handle_request(&mut self, raw_request: Message, to_gateway_file: Option<&mut File>, msg_ts: u128) -> Option<Message> {
+         // apparently tungstenite auto-handles ping/pong/close messages so for now let's ignore
+         // them and let's test that claim. If that's not the case, just copy code from
+         // desktop nym-client websocket as I've manually handled everything there
+         match raw_request {
+-            Message::Binary(bin_msg) => Some(self.handle_binary(bin_msg).await),
++            Message::Binary(bin_msg) => Some(self.handle_binary(bin_msg, to_gateway_file, msg_ts).await),
+             Message::Text(text_msg) => Some(self.handle_text(text_msg).await),
+             _ => None,
+         }
+@@ -368,7 +395,51 @@ where
+         S: AsyncRead + AsyncWrite + Unpin,
+         St: Storage,
+     {
++        let mixcorr_client: String = self.client.address.as_base58_string();
++
+         trace!("Started listening for ALL incoming requests...");
++        trace!("[MIXCORR] [{}] Listening for all incoming requests of one particular client...", mixcorr_client);
++
++        // [MIXCORR] Open files to write out Sphinx traffic flow data.
++        let mixcorr_dir: String = env::var("mixcorr_gateway_sphinxflow_dir").expect("Please provide a correct path in mixcorr_gateway_sphinxflow_dir");
++        trace!("[MIXCORR] [{}] Taken from environment: mixcorr_gateway_sphinxflow_dir='{}'", mixcorr_client, mixcorr_dir);
++
++        let mut to_gateway_file = None;
++        let mut to_endpoint_file = None;
++
++        if mixcorr_dir == "ignore" {
++            trace!("[MIXCORR] [{}] Because mixcorr_gateway_sphinxflow_dir=='{}', we'll not create any SphinxFlow logs", mixcorr_client, mixcorr_dir);
++        } else {
++
++            trace!("[MIXCORR] [{}] Preparing paths and files for SphinxFlow logs of clients at '{}'", mixcorr_client, mixcorr_dir);
++
++            let to_gateway_file_name = format!("{}/{}_endpoint-to-gateway.sphinxflow", mixcorr_dir, mixcorr_client);
++            let to_endpoint_file_name = format!("{}/{}_gateway-to-endpoint.sphinxflow", mixcorr_dir, mixcorr_client);
++
++            // [MIXCORR] File for Sphinx metadata in direction: endpoint to gateway.
++            to_gateway_file = Some(OpenOptions::new()
++                                              .write(true)
++                                              .create(true)
++                                              .open(&to_gateway_file_name)
++                                              .unwrap_or_else(|err| panic!("[MIXCORR] [{}] Error creating file {}: {}", mixcorr_client, &to_gateway_file_name, err)));
++
++            // [MIXCORR] Write header line into file.
++            if let Some(to_gateway_file) = to_gateway_file.as_mut() {
++                to_gateway_file.write_all(b"msg_timestamp_nanos,msg_size_bytes\n").unwrap();
++            };
++
++            // [MIXCORR] File for Sphinx metadata in direction: gateway to endpoint.
++            to_endpoint_file = Some(OpenOptions::new()
++                                               .write(true)
++                                               .create(true)
++                                               .open(&to_endpoint_file_name)
++                                               .unwrap_or_else(|err| panic!("[MIXCORR] [{}] Error creating file {}: {}", mixcorr_client, &to_endpoint_file_name, err)));
++
++            // [MIXCORR] Write header line into file.
++            if let Some(to_endpoint_file) = to_endpoint_file.as_mut() {
++                to_endpoint_file.write_all(b"msg_timestamp_nanos,msg_size_bytes\n").unwrap();
++            };
++        };
+
+         while !shutdown.is_shutdown() {
+             tokio::select! {
+@@ -376,6 +447,13 @@ where
+                     log::trace!("client_handling::AuthenticatedHandler: received shutdown");
+                 }
+                 socket_msg = self.inner.read_websocket_message() => {
++
++                    // [MIXCORR] Take nanoseconds timestamp for WebSocket message.
++                    let msg_ts: u128 = SystemTime::now()
++                                                 .duration_since(SystemTime::UNIX_EPOCH)
++                                                 .unwrap_or_else(|err| panic!("[MIXCORR] [{}] Error taking timestamp endpoint=>gateway: {}", mixcorr_client, err))
++                                                 .as_nanos();
++
+                     let socket_msg = match socket_msg {
+                         None => break,
+                         Some(Ok(socket_msg)) => socket_msg,
+@@ -389,25 +467,52 @@ where
+                         break;
+                     }
+
+-                    if let Some(response) = self.handle_request(socket_msg).await {
++                    trace!("[MIXCORR] [{}] About to handle a new endpoint=>gateway message", mixcorr_client);
++
++                    if let Some(response) = self.handle_request(
++                        socket_msg,
++                        to_gateway_file.as_mut(),
++                        msg_ts).await {
++
++                        trace!("[MIXCORR] [{}] Handled a message from endpoint=>gateway", mixcorr_client);
++
+                         if let Err(err) = self.inner.send_websocket_message(response).await {
+                             warn!(
+                                 "Failed to send message over websocket: {err}. Assuming the connection is dead.",
+                             );
+                             break;
+                         }
++
++                        trace!("[MIXCORR] [{}] Responded to endpoint with result of message handling", mixcorr_client);
+                     }
+                 },
+                 mix_messages = self.mix_receiver.next() => {
+                     let mix_messages = mix_messages.expect("sender was unexpectedly closed! this shouldn't have ever happened!");
+-                    if let Err(err) = self.inner.push_packets_to_client(self.client.shared_keys, mix_messages).await {
++
++                    // [MIXCORR] Take nanoseconds timestamp for mixnet message.
++                    let msg_ts: u128 = SystemTime::now()
++                                                 .duration_since(SystemTime::UNIX_EPOCH)
++                                                 .unwrap_or_else(|err| panic!("[MIXCORR] [{}] Error taking timestamp gateway=>endpoint: {}", mixcorr_client, err))
++                                                 .as_nanos();
++
++                    trace!("[MIXCORR] [{}] About to handle a new gateway=>endpoint message", mixcorr_client);
++
++                    if let Err(err) = self.inner.push_packets_to_client(
++                        self.client.shared_keys,
++                        mix_messages,
++                        to_endpoint_file.as_mut(),
++                        msg_ts).await {
+                         warn!("failed to send the unwrapped sphinx packets back to the client - {err}, assuming the connection is dead");
+                         break;
+                     }
++
++                    trace!("[MIXCORR] [{}] Sent a mixnet message from gateway=>endpoint", mixcorr_client);
+                 }
+             }
+         }
+
++        trace!("[MIXCORR] [{}] Stopped listening for packets on channel with endpoint", mixcorr_client);
++
+         self.disconnect();
+         trace!("The stream was closed!");
+     }
+diff --git a/gateway/src/node/client_handling/websocket/connection_handler/fresh.rs b/gateway/src/node/client_handling/websocket/connection_handler/fresh.rs
+index ebd90206b..f7c4ea3ea 100644
+--- a/gateway/src/node/client_handling/websocket/connection_handler/fresh.rs
++++ b/gateway/src/node/client_handling/websocket/connection_handler/fresh.rs
+@@ -28,6 +28,10 @@ use thiserror::Error;
+ use tokio::io::{AsyncRead, AsyncWrite};
+ use tokio_tungstenite::tungstenite::{protocol::Message, Error as WsError};
+
++// [MIXCORR] Required imports for our patches.
++use std::fs::File;
++use std::io::prelude::*;
++
+ #[derive(Debug, Error)]
+ pub(crate) enum InitialAuthenticationError {
+     #[error("Internal gateway storage error")]
+@@ -196,6 +200,8 @@ where
+         &mut self,
+         shared_keys: SharedKeys,
+         packets: Vec<Vec<u8>>,
++        to_endpoint_file: Option<&mut File>,
++        msg_ts: u128,
+     ) -> Result<(), WsError>
+     where
+         S: AsyncRead + AsyncWrite + Unpin,
+@@ -209,6 +215,26 @@ where
+                     .into_ws_message(&shared_keys))
+             })
+             .collect();
++
++        if let Some(to_endpoint_file) = to_endpoint_file {
++
++            for message in messages.iter() {
++
++                match message {
++                    Ok(msg) => {
++
++                        trace!("[MIXCORR] [push_packets_to_client] Pushing Sphinx packet of size {} from gateway to endpoint", msg.len());
++
++                        // [MIXCORR] Write <msg_ts,msg_size> tuple to file for direction towards endpoint.
++                        let log_line = format!("{},{}\n", msg_ts, msg.len());
++                        to_endpoint_file.write_all(log_line.as_bytes()).unwrap();
++                        to_endpoint_file.flush().unwrap();
++                    },
++                    Err(msg) => warn!("[MIXCORR] [push_packets_to_client] WARNING Error wrapping outgoing packets: {}", msg),
++                }
++            }
++        };
++
+         let mut send_stream = futures::stream::iter(messages);
+         match self.socket_connection {
+             SocketStream::UpgradedWebSocket(ref mut ws_stream) => {
+@@ -255,6 +281,9 @@ where
+         S: AsyncRead + AsyncWrite + Unpin,
+     {
+         let mut start_next_after = None;
++
++        trace!("[MIXCORR] [push_stored_messages_to_client] Checking if messages are available on-disk to mass-send to endpoint {}", client_address);
++
+         loop {
+             // retrieve some messages
+             let (messages, new_start_next_after) = self
+@@ -262,16 +291,23 @@ where
+                 .retrieve_messages(client_address, start_next_after)
+                 .await?;
+
+-            let (messages, ids) = messages
++            let (messages, ids): (Vec<_>, Vec<_>) = messages
+                 .into_iter()
+                 .map(|msg| (msg.content, msg.id))
+                 .unzip();
+
++            // [MIXCORR] Log a warning if on-disk list of messages for this client is bigger than zero.
++            if messages.len() > 0 {
++                warn!("[MIXCORR] [push_stored_messages_to_client] WARNING At least one on-disk message stored for endpoint {}, this should not happen", client_address);
++            }
++
+             // push them to the client
+-            if let Err(err) = self.push_packets_to_client(shared_keys, messages).await {
++            if let Err(err) = self.push_packets_to_client(shared_keys, messages, None, 0).await {
++                trace!("[MIXCORR] [push_stored_messages_to_client] Failed with pushing messages to endpoint {}", client_address);
+                 warn!("We failed to send stored messages to fresh client - {err}",);
+                 return Err(InitialAuthenticationError::ConnectionError(err));
+             } else {
++                trace!("[MIXCORR] [push_stored_messages_to_client] Succeeded with pushing messages to endpoint {}", client_address);
+                 // if it was successful - remove them from the store
+                 self.storage.remove_messages(ids).await?;
+             }
+@@ -284,6 +320,8 @@ where
+             }
+         }
+
++        trace!("[MIXCORR] [push_stored_messages_to_client] Done for endpoint {}", client_address);
++
+         Ok(())
+     }
+
+@@ -386,6 +424,7 @@ where
+             .await?;
+
+         if let Some(shared_keys) = shared_keys {
++            trace!("[MIXCORR] [authenticate_client] About to push stored messages (if they exist) to endpoint {}", client_address);
+             self.push_stored_messages_to_client(client_address, shared_keys)
+                 .await?;
+             Ok(Some(shared_keys))
+@@ -478,6 +517,8 @@ where
+             self.storage.create_bandwidth_entry(client.address).await?;
+         }
+
++        trace!("[MIXCORR] [register_client] About to push stored messages (if they exist) to endpoint {}", client.address);
++
+         self.push_stored_messages_to_client(client.address, client.shared_keys)
+             .await?;
+
+@@ -568,6 +609,7 @@ where
+         S: AsyncRead + AsyncWrite + Unpin + Send,
+     {
+         trace!("Started waiting for authenticate/register request...");
++        trace!("[MIXCORR] [perform_initial_authentication] Initial authentication launched");
+
+         while let Some(msg) = self.read_websocket_message().await {
+             let msg = match msg {
+diff --git a/gateway/src/node/client_handling/websocket/listener.rs b/gateway/src/node/client_handling/websocket/listener.rs
+index 02882cebc..c3c9aae46 100644
+--- a/gateway/src/node/client_handling/websocket/listener.rs
++++ b/gateway/src/node/client_handling/websocket/listener.rs
+@@ -66,6 +66,7 @@ impl Listener {
+                     match connection {
+                         Ok((socket, remote_addr)) => {
+                             trace!("received a socket connection from {remote_addr}");
++                            trace!("[MIXCORR] [run] New Websocket connection from {remote_addr}");
+                             // TODO: I think we *REALLY* need a mechanism for having a maximum number of connected
+                             // clients or spawned tokio tasks -> perhaps a worker system?
+                             let handle = FreshHandler::new(
+diff --git a/gateway/src/node/mixnet_handling/receiver/connection_handler.rs b/gateway/src/node/mixnet_handling/receiver/connection_handler.rs
+index bd566f5c2..58c12ca53 100644
+--- a/gateway/src/node/mixnet_handling/receiver/connection_handler.rs
++++ b/gateway/src/node/mixnet_handling/receiver/connection_handler.rs
+@@ -116,6 +116,7 @@ impl<St: Storage> ConnectionHandler<St> {
+             client_address
+         );
+
++        warn!("[MIXCORR] [{}] WARNING Storing message on-disk because endpoint was unreachable", client_address.as_base58_string());
+         self.storage.store_message(client_address, message).await
+     }
+
+@@ -146,7 +147,10 @@ impl<St: Storage> ConnectionHandler<St> {
+                 Err(err) => error!("Failed to store client data - {err}"),
+                 Ok(_) => trace!("Stored packet for {}", client_address),
+             },
+-            Ok(_) => trace!("Pushed received packet to {}", client_address),
++            Ok(_) => {
++                trace!("Pushed received packet to {}", client_address);
++                trace!("[MIXCORR] [{}] Pushed mixnet-received message to endpoint", client_address.as_base58_string());
++            },
+         }
+
+         // if we managed to either push message directly to the [online] client or store it at
+@@ -183,6 +187,7 @@ impl<St: Storage> ConnectionHandler<St> {
+         debug!("Starting connection handler for {:?}", remote);
+         shutdown.mark_as_success();
+         let mut framed_conn = Framed::new(conn, SphinxCodec);
++        trace!("[MIXCORR] [handle_connection] Starting mixnet connection handler for {:?}", remote);
+         while !shutdown.is_shutdown() {
+             tokio::select! {
+                 biased;

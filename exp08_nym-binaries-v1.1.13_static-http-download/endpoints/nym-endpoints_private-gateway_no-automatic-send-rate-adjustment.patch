@@ -1,0 +1,190 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index dda9321c8..d4e357779 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3965,7 +3965,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "nym-vesting-contract"
+-version = "1.2.0-pre.1"
++version = "1.2.0"
+ dependencies = [
+  "cosmwasm-derive",
+  "cosmwasm-std",
+diff --git a/clients/client-core/src/client/real_messages_control/real_traffic_stream.rs b/clients/client-core/src/client/real_messages_control/real_traffic_stream.rs
+index 4bcebe75d..19c9ce442 100644
+--- a/clients/client-core/src/client/real_messages_control/real_traffic_stream.rs
++++ b/clients/client-core/src/client/real_messages_control/real_traffic_stream.rs
+@@ -333,7 +333,7 @@ where
+     fn poll_poisson(&mut self, cx: &mut Context<'_>) -> Poll<Option<StreamMessage>> {
+         // The average delay could change depending on if backpressure in the downstream channel
+         // (mix_tx) was detected.
+-        self.adjust_current_average_message_sending_delay();
++        // self.adjust_current_average_message_sending_delay();
+         let avg_delay = self.current_average_message_sending_delay();
+ 
+         // Start by checking if we have any incoming messages about closed connections
+diff --git a/clients/client-core/src/client/topology_control/accessor.rs b/clients/client-core/src/client/topology_control/accessor.rs
+index fcb272c93..86bc92d51 100644
+--- a/clients/client-core/src/client/topology_control/accessor.rs
++++ b/clients/client-core/src/client/topology_control/accessor.rs
+@@ -65,21 +65,23 @@ impl<'a> TopologyReadPermit<'a> {
+         // 4. does it have a mixnode on each layer?
+         topology.ensure_can_construct_path_through(DEFAULT_NUM_MIX_HOPS)?;
+ 
++        // [MIXCORR] Below code blocks are commented out to achieve private gateway functionality.
++
+         // 5. does it contain OUR gateway (so that we could create an ack packet)?
+-        if !topology.gateway_exists(ack_recipient.gateway()) {
+-            return Err(NymTopologyError::NonExistentGatewayError {
+-                identity_key: ack_recipient.gateway().to_base58_string(),
+-            });
+-        }
++        // if !topology.gateway_exists(ack_recipient.gateway()) {
++        //     return Err(NymTopologyError::NonExistentGatewayError {
++        //         identity_key: ack_recipient.gateway().to_base58_string(),
++        //     });
++        // }
+ 
+         // 6. for our target recipient, does it contain THEIR gateway (so that we could create
+-        if let Some(recipient) = packet_recipient {
+-            if !topology.gateway_exists(recipient.gateway()) {
+-                return Err(NymTopologyError::NonExistentGatewayError {
+-                    identity_key: recipient.gateway().to_base58_string(),
+-                });
+-            }
+-        }
++        // if let Some(recipient) = packet_recipient {
++        //     if !topology.gateway_exists(recipient.gateway()) {
++        //         return Err(NymTopologyError::NonExistentGatewayError {
++        //             identity_key: recipient.gateway().to_base58_string(),
++        //         });
++        //     }
++        // }
+ 
+         Ok(topology)
+     }
+diff --git a/clients/client-core/src/init/helpers.rs b/clients/client-core/src/init/helpers.rs
+index b3f5e1c46..af5f1e09d 100644
+--- a/clients/client-core/src/init/helpers.rs
++++ b/clients/client-core/src/init/helpers.rs
+@@ -210,20 +210,29 @@ pub(super) async fn query_gateway_details(
+     chosen_gateway_id: Option<identity::PublicKey>,
+     by_latency: bool,
+ ) -> Result<gateway::Node, ClientCoreError> {
+-    let mut rng = thread_rng();
+-    let gateways = current_gateways(&mut rng, validator_servers).await?;
+-
+-    // if we set an explicit gateway, use that one and nothing else
+-    if let Some(explicitly_chosen) = chosen_gateway_id {
+-        gateways
+-            .into_iter()
+-            .find(|gateway| gateway.identity_key == explicitly_chosen)
+-            .ok_or_else(|| ClientCoreError::NoGatewayWithId(explicitly_chosen.to_string()))
+-    } else if by_latency {
+-        choose_gateway_by_latency(&mut rng, gateways).await
+-    } else {
+-        uniformly_random_gateway(&mut rng, gateways)
+-    }
++
++    // [MIXCORR] Return our static private gateway every time this function is called.
++    let gateway: gateway::Node = gateway::Node::static_private_gateway_mixcorr();
++    log::info!("[MIXCORR] [query_gateway_details] Using static private gateway:\n{}\n", gateway);
++
++    return Ok(gateway);
++
++    // [MIXCORR] Below code blocks are commented out to achieve private gateway functionality.
++
++    // let mut rng = thread_rng();
++    // let gateways = current_gateways(&mut rng, validator_servers).await?;
++
++    // // if we set an explicit gateway, use that one and nothing else
++    // if let Some(explicitly_chosen) = chosen_gateway_id {
++    //     gateways
++    //         .into_iter()
++    //         .find(|gateway| gateway.identity_key == explicitly_chosen)
++    //         .ok_or_else(|| ClientCoreError::NoGatewayWithId(explicitly_chosen.to_string()))
++    // } else if by_latency {
++    //     choose_gateway_by_latency(&mut rng, gateways).await
++    // } else {
++    //     uniformly_random_gateway(&mut rng, gateways)
++    // }
+ }
+ 
+ pub(super) async fn register_with_gateway(
+diff --git a/common/topology/src/gateway.rs b/common/topology/src/gateway.rs
+index 8a2a42492..9ec23ec9f 100644
+--- a/common/topology/src/gateway.rs
++++ b/common/topology/src/gateway.rs
+@@ -12,6 +12,9 @@ use std::io;
+ use std::net::SocketAddr;
+ use thiserror::Error;
+ 
++// [MIXCORR] Required imports for our patches.
++use std::env;
++
+ #[derive(Error, Debug)]
+ pub enum GatewayConversionError {
+     #[error("gateway identity key was malformed - {0}")]
+@@ -53,6 +56,32 @@ impl Node {
+     pub fn clients_address(&self) -> String {
+         format!("ws://{}:{}", self.host, self.clients_port)
+     }
++
++    // [MIXCORR] Return our static private gateway.
++    pub fn static_private_gateway_mixcorr() -> Self {
++
++        let mixcorr_static_private_gateway_owner: String = env::var("mixcorr_static_private_gateway_owner").expect("Provide environment variable mixcorr_static_private_gateway_owner");
++        let mixcorr_static_private_gateway_stake: String = env::var("mixcorr_static_private_gateway_stake").expect("Provide environment variable mixcorr_static_private_gateway_stake");
++        let mixcorr_static_private_gateway_location: String = env::var("mixcorr_static_private_gateway_location").expect("Provide environment variable mixcorr_static_private_gateway_location");
++        let mixcorr_static_private_gateway_host: String = env::var("mixcorr_static_private_gateway_host").expect("Provide environment variable mixcorr_static_private_gateway_host");
++        let mixcorr_static_private_gateway_mix_host: String = env::var("mixcorr_static_private_gateway_mix_host").expect("Provide environment variable mixcorr_static_private_gateway_mix_host");
++        let mixcorr_static_private_gateway_clients_port: String = env::var("mixcorr_static_private_gateway_clients_port").expect("Provide environment variable mixcorr_static_private_gateway_clients_port");
++        let mixcorr_static_private_gateway_identity_key: String = env::var("mixcorr_static_private_gateway_identity_key").expect("Provide environment variable mixcorr_static_private_gateway_identity_key");
++        let mixcorr_static_private_gateway_sphinx_key: String = env::var("mixcorr_static_private_gateway_sphinx_key").expect("Provide environment variable mixcorr_static_private_gateway_sphinx_key");
++        let mixcorr_static_private_gateway_version: String = env::var("mixcorr_static_private_gateway_version").expect("Provide environment variable mixcorr_static_private_gateway_version");
++
++        Node {
++            owner: mixcorr_static_private_gateway_owner,
++            stake: u128::from_str_radix(&mixcorr_static_private_gateway_stake, 10).unwrap(),
++            location: mixcorr_static_private_gateway_location,
++            host: mixcorr_static_private_gateway_host.parse::<NetworkAddress>().unwrap(),
++            mix_host: mixcorr_static_private_gateway_mix_host.parse::<SocketAddr>().unwrap(),
++            clients_port: u16::from_str_radix(&mixcorr_static_private_gateway_clients_port, 10).unwrap(),
++            identity_key: identity::PublicKey::from_base58_string(mixcorr_static_private_gateway_identity_key).unwrap(),
++            sphinx_key: encryption::PublicKey::from_base58_string(mixcorr_static_private_gateway_sphinx_key).unwrap(),
++            version: mixcorr_static_private_gateway_version,
++        }
++    }
+ }
+ 
+ impl fmt::Display for Node {
+diff --git a/common/topology/src/lib.rs b/common/topology/src/lib.rs
+index 4eab44460..100c08599 100644
+--- a/common/topology/src/lib.rs
++++ b/common/topology/src/lib.rs
+@@ -196,11 +196,19 @@ impl NymTopology {
+     where
+         R: Rng + CryptoRng + ?Sized,
+     {
+-        let gateway = self.get_gateway(gateway_identity).ok_or(
+-            NymTopologyError::NonExistentGatewayError {
+-                identity_key: gateway_identity.to_base58_string(),
+-            },
+-        )?;
++        // [MIXCORR] Below code block is commented out to achieve private gateway functionality.
++        // [MIXCORR] Mind that the way how this is implemented endpoints with this patch won't
++        // [MIXCORR] be able to contact endpoints at gateways other than the static private one,
++        // [MIXCORR] as any route will inevitably end in the static private gateway below.
++
++        // let gateway = self.get_gateway(gateway_identity).ok_or(
++        //     NymTopologyError::NonExistentGatewayError {
++        //         identity_key: gateway_identity.to_base58_string(),
++        //     },
++        // )?;
++
++        // [MIXCORR] Obtain node details of our static private gateway.
++        let gateway = &gateway::Node::static_private_gateway_mixcorr();
+ 
+         Ok(self
+             .random_mix_route(rng, num_mix_hops)?

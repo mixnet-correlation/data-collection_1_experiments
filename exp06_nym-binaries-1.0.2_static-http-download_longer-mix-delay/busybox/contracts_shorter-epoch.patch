@@ -1,0 +1,34 @@
+diff --git a/common/cosmwasm-smart-contracts/mixnet-contract/src/interval.rs b/common/cosmwasm-smart-contracts/mixnet-contract/src/interval.rs
+index 862851ca..c805a3fd 100644
+--- a/common/cosmwasm-smart-contracts/mixnet-contract/src/interval.rs
++++ b/common/cosmwasm-smart-contracts/mixnet-contract/src/interval.rs
+@@ -108,7 +108,7 @@ impl Interval {
+             // I really don't see a way for this to fail, unless the blockchain is lying to us
+             start: OffsetDateTime::from_unix_timestamp(env.block.time.seconds() as i64)
+                 .expect("Invalid timestamp from env.block.time"),
+-            length: Duration::from_secs(3600),
++            length: Duration::from_secs(180),
+         }
+     }
+ 
+diff --git a/contracts/mixnet/src/constants.rs b/contracts/mixnet/src/constants.rs
+index a19aa4fe..df34dc35 100644
+--- a/contracts/mixnet/src/constants.rs
++++ b/contracts/mixnet/src/constants.rs
+@@ -2,7 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ // approximately 1 epoch (assuming 5s per block)
+-pub const MINIMUM_BLOCK_AGE_FOR_REWARDING: u64 = 720;
++pub const MINIMUM_BLOCK_AGE_FOR_REWARDING: u64 = 36;
+ 
+ pub const INTERVAL_REWARD_PERCENT: u8 = 2; // Used to calculate interval reward pool
+ pub const SYBIL_RESISTANCE_PERCENT: u8 = 30;
+@@ -12,6 +12,6 @@ pub const ACTIVE_SET_WORK_FACTOR: u8 = 10;
+ // However, since the blocktime is not EXACTLY 5s, we can't really guarantee 720 epochs in interval
+ // and we can't change this easily to `Duration`, because then the entire rewarded set storage
+ // would be messed up... (as we look up stuff "by blocks")
+-pub const REWARDED_SET_REFRESH_BLOCKS: u64 = 720; // with blocktime being approximately 5s, it should be roughly 1h
++pub const REWARDED_SET_REFRESH_BLOCKS: u64 = 36; // with blocktime being approximately 5s, it should be roughly 1h
+ pub const INTERVAL_SECONDS: u64 = 86400 * 30; // 30 days
+ pub const DEFAULT_OPERATOR_INTERVAL_COST: u64 = 40_000_000;

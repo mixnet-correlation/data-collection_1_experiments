@@ -1,0 +1,63 @@
+diff --git a/clients/client-core/src/client/real_messages_control/real_traffic_stream.rs b/clients/client-core/src/client/real_messages_control/real_traffic_stream.rs
+index 47d95d0d..bdeafa2c 100644
+--- a/clients/client-core/src/client/real_messages_control/real_traffic_stream.rs
++++ b/clients/client-core/src/client/real_messages_control/real_traffic_stream.rs
+@@ -153,7 +153,12 @@ where
+             }
+ 
+             // otherwise construct a dummy one
+-            Poll::Pending => Poll::Ready(Some(StreamMessage::Cover)),
++            Poll::Pending => {
++                // [MIXCORR] For this cover-disabling patch, return Pending instead of
++                // [MIXCORR] 'Poll::Ready(Some(StreamMessage::Cover))' when no genuine
++                // [MIXCORR] message is available to be sent.
++                Poll::Pending
++            }
+         }
+     }
+ }
+diff --git a/clients/client-core/src/client/received_buffer.rs b/clients/client-core/src/client/received_buffer.rs
+index ad77b82e..99634ff1 100644
+--- a/clients/client-core/src/client/received_buffer.rs
++++ b/clients/client-core/src/client/received_buffer.rs
+@@ -56,6 +56,10 @@ impl ReceivedMessagesBufferInner {
+ 
+         if nymsphinx::cover::is_cover(&fragment_data) {
+             trace!("The message was a loop cover message! Skipping it");
++
++            // [MIXCORR] Make sure to log if this unwanted event occurs.
++            info!("[MIXCORR] [process_received_fragment] We received a Cover message, but shouldn't have for this experiment");
++
+             return None;
+         }
+ 
+diff --git a/clients/native/src/client/mod.rs b/clients/native/src/client/mod.rs
+index b7950018..2f705b2e 100644
+--- a/clients/native/src/client/mod.rs
++++ b/clients/native/src/client/mod.rs
+@@ -374,7 +374,9 @@ impl NymClient {
+             sphinx_message_sender.clone(),
+         );
+ 
+-        self.start_cover_traffic_stream(shared_topology_accessor, sphinx_message_sender);
++        // [MIXCORR] We disabled cover traffic.
++        info!("[MIXCORR] [start] We would have started LoopCoverTrafficStream here, but we disabled cover traffic, thus skip this step");
++        // self.start_cover_traffic_stream(shared_topology_accessor, sphinx_message_sender);
+ 
+         match self.config.get_socket_type() {
+             SocketType::WebSocket => {
+diff --git a/clients/socks5/src/client/mod.rs b/clients/socks5/src/client/mod.rs
+index 6669a994..cebfdcbe 100644
+--- a/clients/socks5/src/client/mod.rs
++++ b/clients/socks5/src/client/mod.rs
+@@ -353,7 +353,9 @@ impl NymClient {
+             sphinx_message_sender.clone(),
+         );
+ 
+-        self.start_cover_traffic_stream(shared_topology_accessor, sphinx_message_sender);
++        // [MIXCORR] We disabled cover traffic.
++        info!("[MIXCORR] [start] We would have started LoopCoverTrafficStream here, but we disabled cover traffic, thus skip this step");
++        // self.start_cover_traffic_stream(shared_topology_accessor, sphinx_message_sender);
+         self.start_socks5_listener(received_buffer_request_sender, input_sender);
+ 
+         info!("Client startup finished!");
